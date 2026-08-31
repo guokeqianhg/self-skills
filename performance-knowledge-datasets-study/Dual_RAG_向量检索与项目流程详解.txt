@@ -1,0 +1,952 @@
+PerfDog Dual RAG：向量检索、Qdrant、Reranker 与项目流程详解
+============================================================
+
+一、先用一句话说清这个项目
+----------------------------
+
+perfdog_dual_rag 是知识库的“下游检索与证据打包层”。
+
+它接收上游 LLM Wiki 已经生产好的：
+
+    cards_validated.jsonl
+    + wiki/ Markdown 页面
+
+把它们合成为适合检索的 rag_docs.jsonl；随后提供两种检索后端：
+
+    1. local：BM25 + 词频余弦 + 性能领域规则；
+    2. qdrant：真实 dense/sparse 向量检索 + Qdrant 混合召回 + 可解释规则精排。
+
+最终，它不会直接裁决“当前性能问题的根因”，而是返回：
+
+    现象卡 + 根因卡 + 验证卡 + 优化卡
+    + 来源主张 + 反证 + 风险 + 适用条件
+
+即给下游 Agent/LLM 使用的结构化证据包（agent_context）。
+
+准确定位：
+
+    上游 Wiki Starter 负责“生产和治理知识”；
+    Dual RAG 负责“把知识检索出来并组织成证据”；
+    下游 Agent 才结合当前真实 PerfDog 报告做归因和最终回答。
+
+
+二、先把容易混淆的概念讲清楚
+------------------------------
+
+2.1 什么是向量（Vector）？
+
+向量可以理解为“一串数字”，例如：
+
+    [0.12, -0.03, 0.81, ...]
+
+文本经过 embedding 模型后，会变成固定长度的数字向量。语义接近的文本，理论上在向量空间里距离更近。
+
+举例：
+
+    “转场时掉帧、帧时间尖峰”
+    “场景切换发生长尾卡顿”
+
+虽然字面词不完全一样，但 embedding 模型希望把它们编码成较接近的向量。
+
+本项目当前 dense 向量维度是：
+
+    1024 维
+
+这不是业务代码手写出来的数字，而是当前 dense embedding 模型实际输出的向量长度。
+
+
+2.2 什么是 Embedding / 向量模型？
+
+Embedding 模型是“文本 -> 数字向量”的模型。
+
+本项目 Qdrant 后端使用 FastEmbed，默认 dense 模型是：
+
+    thenlper/gte-large
+
+它把 rag_doc 的 dense_text 编码为 1024 维浮点向量。
+
+注意：
+
+    local 后端里的 dense_score 不是 gte-large 生成的真实向量分数。
+    它只是对 token 词频 Counter 计算 cosine，相当于可解释的词面相似度。
+
+因此不能把 local 说成“本地 embedding 检索”。
+
+正确说法：
+
+    local 是 BM25 + token-counter cosine + 领域规则的可解释基线；
+    qdrant 才是真正使用 embedding 向量模型的后端。
+
+
+2.3 什么是稠密向量（Dense Vector）？
+
+Dense 意味着向量的绝大多数维度都有浮点数：
+
+    [0.18, -0.04, 0.77, 0.01, ...]
+
+适合做语义相似度检索。
+
+本项目：
+
+    dense_text
+    -> thenlper/gte-large
+    -> dense 向量
+    -> Qdrant 的 named vector: dense
+
+Qdrant collection 使用 cosine distance 衡量 dense 向量相似度。
+
+
+2.4 什么是稀疏向量（Sparse Vector）？
+
+Sparse 向量不是保存完整数组，而是只记录“有值的词项位置与权重”：
+
+    token_id -> weight
+
+适合关键词、指标名、专有术语的精确匹配。
+
+本项目 Qdrant 后端默认 sparse 模型：
+
+    Qdrant/bm25
+
+处理的输入是 sparse_text，写入 Qdrant named vector：
+
+    sparse
+
+它的价值是弥补 dense 语义检索可能忽略精确术语的问题。例如：
+
+    low1pct
+    p99FrameTimeMs
+    smallJankPer10min
+    external_tool_dependency
+
+这些字段/术语通常需要较强的词面匹配能力。
+
+
+2.5 什么是向量库（Vector Database）？
+
+向量库不是“只存一堆数字”。它通常同时保存：
+
+    向量
+    + 原始 payload / 元数据
+    + 向量索引
+    + 条件过滤能力
+    + 相似度查询能力
+
+本项目用的向量库是 Qdrant。
+
+每条 rag_doc 入库时会形成一个 Qdrant point：
+
+    point id：顺序整数
+    vector：
+      - dense：gte-large 向量
+      - sparse：Qdrant/bm25 稀疏向量
+    payload：完整 rag_doc 字段
+
+payload 中包括：
+
+    card_id、title、summary、card_type、platforms、engines、metrics、
+    required_signals、supporting_signals、review_status、priority、warnings、
+    source_url、wiki_path、dense_text、sparse_text 等。
+
+所以 Qdrant 不只知道“这段文本像不像”，也可以按 payload 过滤：
+
+    只要 P0？
+    只要 root_cause？
+    只要 human_reviewed / auto_checked？
+    排除 external_tool_dependency warning？
+
+
+2.6 什么是 Qdrant？
+
+Qdrant 是专门做向量相似度检索的数据库/引擎。
+
+本项目支持两种部署模式：
+
+1. 本地目录模式
+
+    QdrantClient(path="data/qdrant")
+
+索引文件直接存本地目录，适合本机开发、单机演示或单副本环境。
+
+2. 远程服务模式
+
+    QdrantClient(url="http://qdrant:6333")
+
+适合 Docker Compose、共享环境或未来独立 Qdrant Server。
+
+当前本地 manifest 记录：
+
+    collection_name: perfdog_rag_cards
+    dense_model: thenlper/gte-large
+    sparse_model: Qdrant/bm25
+    dense_vector_size: 1024
+    batch_size: 16
+
+
+2.7 什么是 Hybrid Retrieval（混合检索）？
+
+Hybrid Retrieval = dense 语义召回 + sparse 关键词召回。
+
+本项目的 Qdrant 默认流程：
+
+    query_text
+    -> dense embedding
+    -> sparse embedding
+    -> Qdrant dense prefetch
+    -> Qdrant sparse prefetch
+    -> Fusion 融合
+    -> 得到候选集
+
+为什么需要两路？
+
+- dense：解决同义表达、自然语言症状描述；
+- sparse：保证指标名、技术术语、明确关键词不会被语义模型忽略。
+
+
+2.8 什么是 Fusion（融合）？
+
+dense 和 sparse 各自会得到一个排序。Fusion 是把两条排序合成一条候选排序的方法。
+
+本项目支持：
+
+    rrf
+    dbsf
+
+默认：
+
+    dbsf
+
+- RRF：Reciprocal Rank Fusion，主要看两路排名位置；
+- DBSF：Qdrant 的分数分布融合方式。
+
+项目没有手写 RRF/DBSF 数学公式，也没有给 dense/sparse 单独设置业务权重；它调用 Qdrant 的 FusionQuery。
+
+
+2.9 什么是 Candidate（候选集）？
+
+候选集是第一阶段召回的“大池子”，不是最终给用户的 top K。
+
+本项目通常：
+
+    top_k = 3
+    candidate_limit = 128（默认）
+
+但实际候选下限会按 top_k 和卡片类型数放大：
+
+    max(requested_limit, top_k * 类型数 * 12, top_k * 24, 128)
+
+目的：先尽量多召回，再有足够材料给第二阶段精排。
+
+
+2.10 什么是 Reranker（重排器）？本项目的 reranker 是模型吗？
+
+“Reranker”泛指候选召回之后再排序的第二阶段组件。
+
+常见 reranker 可以是：
+
+    Cross-Encoder 模型
+    LLM
+    规则系统
+
+本项目默认 rerank_mode 是：
+
+    local_hybrid
+
+但它不是 Cross-Encoder，也不是单独的神经网络 reranker 模型，更不是 LLM。
+
+它的实际实现是：
+
+    对 Qdrant 已召回的候选池
+    -> 在候选池里重新建 BM25
+    -> 重新计算 token Counter cosine
+    -> 复用平台/引擎匹配、指标/信号对齐、优先级、审核状态、warning 等本地规则
+    -> 按 local score 重新排序
+
+所以面试必须说：
+
+    “我们当前的 reranker 是可解释的本地规则 hybrid reranker，
+    而不是 Cross-Encoder 或 LLM reranker。”
+
+
+三、本项目的完整数据流
+----------------------
+
+    上游 LLM Wiki Starter
+        cards_validated.jsonl（正式知识卡）
+        + wiki/（人可读 Markdown 页面）
+                    |
+                    v
+    builder.build_rag_corpus()
+        - 按 card_id 对齐 card 与 Wiki
+        - 跳过 rag_excluded 和指定 review_status
+        - 构造 rag_doc
+        - 生成 dense_text / sparse_text
+                    |
+                    v
+    data/rag_docs.jsonl + data/build_report.json
+                    |
+          +---------+---------+
+          |                   |
+          v                   v
+    backend=local       build_qdrant_index()
+    BM25 + Counter      dense_text -> gte-large
+    cosine + 规则       sparse_text -> Qdrant/bm25
+          |                   |
+          |                   v
+          |            Qdrant collection
+          |                   |
+          +---------+---------+
+                    |
+                    v
+    QuerySpec + EvidenceFrame
+                    |
+                    v
+    local：全量打分
+    qdrant：dense/sparse hybrid 召回候选 -> local_hybrid 精排（默认）
+                    |
+                    v
+    final_reporter：回表、补来源证据、验证、优化、风险
+                    |
+                    v
+    retrieval package / agent_context / Markdown 报告
+
+
+四、阶段 A：构建统一 RAG 语料
+----------------------------
+
+核心文件：
+
+    src/perfdog_dual_rag/builder.py
+
+4.1 为什么不直接把 cards JSONL 或 Wiki 丢进向量库？
+
+因为两者各有优势：
+
+- card：结构化，含指标、信号、优先级、warning、来源信息；
+- Wiki：人可读，含更完整的解释与展示上下文。
+
+builder 把二者合成 rag_doc，既保留可检索的结构字段，也保留适合 embedding 的文本。
+
+4.2 build_rag_corpus() 的职责
+
+输入：
+
+    starter_root
+    output_root
+    可选 cards_path
+    可选 wiki_root
+    可选 excluded_review_statuses
+
+实际行为：
+
+1. 优先发现 cards_validated.jsonl；不存在时才回退 cards_draft.jsonl；
+2. 读取 Wiki 页面、index.md、index_core.md；
+3. 以 card_id 对齐一张 card 与对应 Wiki 页面；
+4. 若 card.rag_excluded=true，跳过，不写入 RAG；
+5. 若 review_status 属于 excluded_review_statuses，也跳过；
+6. 没有 Wiki 页面时不会阻断，仍会用 card 生成 rag_doc，并在报告记录 missing Wiki；
+7. 写：
+
+    data/rag_docs.jsonl
+    data/build_report.json
+
+4.3 rag_doc 的关键字段
+
+每个 rag_doc 包含：
+
+- 身份：doc_id=card:<card_id>、card_id、canonical_key、chunk_index；
+- 分类：card_type、priority、review_status、generalization_level；
+- 约束：platforms、engines、platform_filter_mode；
+- 检索证据：metrics、required_signals、supporting_signals、unmapped_signals、root_cause_categories；
+- 质量信息：validation_warnings、validation_issues、is_p0、listed_in_core_index；
+- 来源：source_id、source_title、source_url、wiki_path；
+- 诊断辅助文本：diagnosis_text、support_evidence_text、contradiction_text、verification_text、optimization_text；
+- 检索正文：dense_text、sparse_text；
+- 展示文本：display_markdown。
+
+4.4 dense_text 与 sparse_text 有什么区别？
+
+- dense_text：尽量包含标题、摘要、Wiki 正文、诊断/验证/优化等自然语言上下文，适合 embedding 模型理解语义；
+- sparse_text：更强调 title、metrics、signals、category、warning 等字段，适合关键词/BM25 精确命中。
+
+一句话：
+
+    dense_text 面向“意思像不像”；
+    sparse_text 面向“术语和字段有没有命中”。
+
+4.5 rag_excluded 是什么？
+
+rag_excluded=true 不是删卡。
+
+它表示：
+
+    卡仍保留在 cards_validated.jsonl，也可继续在 Wiki 中存在；
+    但 build_rag_corpus() 不把它写入 rag_docs.jsonl；
+    因而它不会进入后续 Qdrant 检索。
+
+这是知识的“软下线/检索可见性开关”。
+
+
+五、阶段 B：建立 Qdrant 向量索引
+--------------------------------
+
+核心文件：
+
+    src/perfdog_dual_rag/vector_store.py
+
+5.1 默认配置
+
+    DEFAULT_DENSE_MODEL = thenlper/gte-large
+    DEFAULT_SPARSE_MODEL = Qdrant/bm25
+    DEFAULT_COLLECTION_NAME = perfdog_rag_cards
+    dense vector name = dense
+    sparse vector name = sparse
+    默认 batch_size = 16
+
+5.2 建库过程
+
+    rag_docs.jsonl
+    -> 读取全部 docs
+    -> dense_text 列表送入 TextEmbedding(gte-large)
+    -> sparse_text 列表送入 SparseTextEmbedding(Qdrant/bm25)
+    -> 确认两路向量数量均等于 docs 数量
+    -> 创建 Qdrant collection
+    -> 每条 doc 写为一个 point（vectors + 完整 payload）
+    -> count 校验 point_count 是否等于 docs 数量
+    -> 写 qdrant_manifest.json
+
+如果 embedding 数量与 docs 数量不一致，建库直接中止；不会默默写不完整索引。
+
+5.3 Collection 如何配置？
+
+collection 创建时：
+
+    dense：VectorParams(size=1024, distance=COSINE)
+    sparse：SparseVectorParams()
+
+因此 dense 用余弦距离；sparse 是 Qdrant 的稀疏向量配置。
+
+5.4 本地建库如何降低“半成品索引”风险？
+
+本地 Qdrant 不直接覆盖正式目录，而是：
+
+    data/qdrant__rebuild__
+    -> 在临时目录完整建库
+    -> 关闭 Qdrant client
+    -> 删除旧 data/qdrant
+    -> 将临时目录 rename 为 data/qdrant
+
+这样只有完整写入且 point_count 校验通过后，才替换正式目录。
+
+注意：这不是跨进程事务。
+
+- 如果目标目录正被其他 Qdrant 进程占用，会报错；
+- 本地目录模式不支持多个进程/多个副本同时访问同一索引目录；
+- Gateway 进程内有锁，但不能替代跨容器分布式锁。
+
+5.5 远程 Qdrant 为什么用 alias？
+
+远程服务模式不会直接覆盖正在读的 collection。
+
+它会：
+
+    创建 collection__build__<UTC时间戳>
+    -> 写入完整 vectors/points
+    -> point_count 校验
+    -> 将对外 alias（默认 perfdog_rag_cards）切换到新 collection
+
+好处：查询侧持续使用 alias；新索引建完后才切换，可避免读到半成品 collection。
+
+5.6 manifest 是什么，为什么重要？
+
+建库后写：
+
+    data/qdrant_manifest.json
+
+里面记录：
+
+    rag_docs_path
+    qdrant_path / qdrant_url
+    collection_name
+    dense_model / sparse_model
+    dense_vector_size
+    point_count
+    batch_size
+    payload_fields
+    built_at
+
+检索时优先从 manifest 读取模型名。
+
+目的：防止“建库时用了模型 A，查询时却拿模型 B 编 query”的隐蔽事故。
+
+
+六、阶段 C：查询理解与结构化证据帧
+----------------------------------
+
+核心文件：
+
+    query_understanding.py
+    retriever.py
+    text_utils.py
+
+外部请求不是只有一句自然语言，而是被整理为 QuerySpec：
+
+    platform
+    engine
+    metrics
+    symptoms
+    anti_signals
+    card_types
+    card_priorities
+    review_statuses
+    exclude_warnings
+    strict_platform
+    strict_engine
+
+QuerySpec 初始化时会：
+
+- 清洗、去重各列表字段；
+- 标准化 review_status 和 warning；
+- 调用 build_query_evidence_frame() 生成 query_frame。
+
+EvidenceFrame 是规则抽取出来的结构化证据表达，包含：
+
+    平台、引擎、指标族、正向信号、负向信号、场景、趋势、干预、假说域。
+
+例如用户输入：
+
+    平均 FPS 还行，但转场有明显长尾卡顿；GPU 不持续拉满。
+
+系统会尝试抽出：
+
+    frame time / jank 类指标与正向现象；
+    转场场景；
+    GPU 未打满的反证；
+    从而让 GPU bottleneck 相关卡在规则对齐中被扣分，
+    同时让 CPU、资源加载、frame pacing 等其他假说有机会被支持。
+
+注意：query understanding 是规则和别名归一，不是 LLM query rewrite。
+
+
+七、Local 后端：可解释的无向量库基线
+-------------------------------------
+
+核心文件：
+
+    retriever.py
+    text_utils.py
+
+7.1 为什么保留 local？
+
+local 的价值：
+
+- 不依赖 FastEmbed、模型下载或 Qdrant；
+- 易于解释和调试；
+- 可与 Qdrant 检索做对照；
+- 可作为显式选择的轻依赖后端。
+
+注意：代码没有确认“Qdrant 失败后自动切 local”的逻辑。调用方要显式传：
+
+    backend=local
+
+7.2 local 的实际算法
+
+1. 对所有 rag_docs 的 sparse_text 分词，建立 BM25 统计；
+2. 对每个 rag_doc 的 dense_text 分词，用 Counter 形成词频向量；
+3. 为不同 card_type 构造对应 query_text；
+4. 对每张 doc 计算：
+
+    BM25 score
+    + token-counter cosine
+    + 平台/引擎匹配倍率
+    + 指标/信号/假说证据对齐
+    + priority/review bonus
+    - warning penalty
+
+5. 按 card_type 分组，各取 top_k。
+
+7.3 Local 分数公式
+
+核心函数：
+
+    retriever.score_doc()
+
+公式可表达为：
+
+    total = ((BM25 * 0.58) + (CounterCosine * 0.42))
+            * platformMultiplier
+            * engineMultiplier
+            + metricSignalBoost
+            + compositeMetricAdjustment
+            + priorityBoost
+            + reviewBoost
+            - warningPenalty
+
+BM25 参数：
+
+    k1 = 1.5
+    b = 0.75
+
+7.4 平台/引擎规则
+
+平台：
+
+    无查询平台：1.0
+    文档无平台：0.92
+    精确匹配：1.08
+    general_principle soft fallback：0.78
+    一般 soft mismatch：0.68
+    strict 不匹配：直接排除（score_doc 返回 None）
+
+引擎：
+
+    无查询引擎：1.0
+    文档无引擎：0.94
+    精确匹配：1.05
+    general_principle soft fallback：0.80
+    一般 soft mismatch：0.72
+    strict 不匹配：直接排除
+
+平台差异类卡会带 strict platform_filter_mode，平台不匹配直接过滤，避免把 Android/iOS 差异错误泛化。
+
+7.5 证据对齐：为什么这比纯相似度更适合性能诊断？
+
+EvidenceFrame 会对比 query 与 doc 的：
+
+    metric families
+    required/supporting signals
+    positive/negative signals
+    scene
+    trend
+    intervention
+    hypothesis domains
+
+加分上限示例：
+
+    metric family：每项 0.035，最多 0.10
+    required signals：每项 0.045，最多 0.12
+    supporting signals：每项 0.025，最多 0.08
+    positive signals：每项 0.02，最多 0.06
+    negative signals：每项 0.018，最多 0.05
+
+还会处理冲突。例如：
+
+    Query 已明确 GPU 不高
+    -> GPU bottleneck 假说会被识别为 conflict domain
+    -> composite adjustment 扣分
+
+复合支持最高可加：
+
+    0.06 * 支持假说数，最多 0.18
+
+冲突最高扣：
+
+    0.09 * 冲突假说数，最多 0.24
+
+required_signals 缺失或 contradiction 命中也会额外扣分。
+
+7.6 质量加减分
+
+priority：
+
+    P0：+0.14
+    核心 Wiki index：额外 +0.04
+
+review：
+
+    human_reviewed：+0.12
+    auto_checked：+0.04
+    draft：0
+    未知状态：-0.10
+
+warning penalty：
+
+    external_tool_dependency：0.06
+    low_metric_anchor：0.08
+    measurement_constraint_card：0.07
+    non_core_methodology_card：0.07
+    language_mixed_output：0.03
+    claim_strength_may_overreach：0.02
+    platform/engine scope exceeds hint：各 0.015
+
+warning 总扣分上限：0.20。
+
+因此 local 不是“按关键词排序”，而是一个可解释的性能知识排序器。
+
+
+八、Qdrant 后端：真实向量候选召回 + 可解释精排
+------------------------------------------------
+
+核心文件：
+
+    qdrant_retriever.py
+    reranker.py
+
+8.1 查询前准备
+
+retrieve_qdrant() 会：
+
+1. 检查本地 Qdrant 路径是否存在；远程 URL 模式可不依赖本地路径；
+2. 校验 fusion 只能是 rrf / dbsf；
+3. 校验 rerank_mode 只能是 none / local_hybrid；
+4. 从 manifest 读取建库时模型名；调用方显式传模型名才覆盖 manifest；
+5. 从 LRU cache 获取 dense/sparse embedder。
+
+embedder 缓存：
+
+    _get_dense_embedder：lru_cache(maxsize=4)
+    _get_sparse_embedder：lru_cache(maxsize=4)
+
+它缓存的是“已加载模型实例”，避免同一 Python 进程每次查询都重新初始化模型。
+
+8.2 Qdrant payload filter
+
+Qdrant 一阶段会先应用硬过滤：
+
+    review_statuses
+    card_type
+    card_priority
+    exclude_warnings
+
+平台和引擎不在 Qdrant filter 中做硬 filter，而是后续用 local 规则的 soft/strict 匹配处理。原因是通用原则类文档可能跨平台/跨引擎仍有价值，不能过早过滤掉。
+
+8.3 对每类卡分别查询
+
+如果请求指定 card_types，例如：
+
+    phenomenon_pattern
+    root_cause
+    verification_method
+    optimization_action
+
+Qdrant 会对每类卡分别构造 query_text 和 filter，分别查候选。
+
+意义：不会出现“root_cause 结果占满候选池，verification_method 一条也没有”的类型饥饿问题。
+
+8.4 Hybrid 查询
+
+默认 hybrid=True：
+
+    dense query vector
+    + sparse query vector
+    -> 两路 Prefetch
+    -> FusionQuery(DBSF 或 RRF)
+    -> candidate points
+
+传 dense_only=true 时，会关闭 sparse，变成只查 dense 向量。
+
+8.5 默认 rerank_mode=local_hybrid
+
+默认路径：
+
+    Qdrant 分数用于“谁进入候选池”
+    -> local_hybrid 用本地 BM25 + Counter cosine + 证据/质量规则决定最终排序
+    -> 每种 card_type 最终返回 top_k
+
+非常重要：
+
+    默认 local_hybrid 下，Qdrant 原始 score 不直接决定最终排序。
+    它仍会返回 qdrant_score、qdrant_rank 等调试字段，
+    但 final score 使用 local_rerank_score。
+
+这就是“语义召回负责高召回，领域规则负责最后排序”。
+
+8.6 rerank_mode=none 时
+
+关闭二阶段重排时，最终分数改为：
+
+    normalized_qdrant_score
+    * platformMultiplier
+    * engineMultiplier
+    + qdrant_rank_bonus
+    + metricSignalBoost
+    + compositeMetricAdjustment
+    + priorityBoost
+    + reviewBoost
+    - warningPenalty
+
+其中 rank bonus：
+
+    0.24 / log2(rank + 1)
+
+所以即使 rerank_mode=none，仍会有平台/引擎、证据、优先级、审核、warning 等规则调整；它不是“纯 Qdrant 原始分”。
+
+
+九、Final Reporter：为什么检索后还要再打包？
+------------------------------------------------
+
+核心文件：
+
+    final_reporter.py
+
+如果只返回：
+
+    card_id + score + title
+
+下游 Agent 仍要自己回表找来源、验证步骤、优化动作、风险和反证，容易遗漏信息。
+
+因此 final_reporter 会：
+
+    检索命中
+    -> 根据 build_report 回到上游 cards
+    -> 按 card_type 组织为现象、根因、验证、优化等 section
+    -> 补 source_claims、verification_steps、optimization_actions、risks、applicability
+    -> 输出 package
+    -> 再压缩为 agent_context
+
+agent_context 的核心结构：
+
+    package_meta：backend、fusion、rerank、top_k、证据上限
+    problem：platform、engine、metrics、symptoms、anti_signals、query_evidence、problem_statement
+    summary：命中数、概览、分类计数
+    matched_cards_by_type：按卡片类型组织的结构化证据
+
+它是“给 Agent 的证据底座”，不是已经生成的最终诊断结论。
+
+
+十、Service Facade 与 API 连接方式
+----------------------------------
+
+核心文件：
+
+    service_facade.py
+
+职责：
+
+    外部 JSON payload
+    -> 参数类型检查、默认值、枚举校验
+    -> QuerySpec
+    -> 检索/报告打包
+    -> 统一 response
+
+关键输入字段：
+
+    backend：local / qdrant，默认 qdrant
+    platform、engine
+    metrics、symptoms、anti_signals
+    card_types、card_priorities、review_statuses、exclude_warnings
+    strict_platform、strict_engine
+    top_k
+    qdrant_path、qdrant_url、collection_name
+    candidate_limit、fusion、dense_only、rerank_mode
+    dense_model、sparse_model
+    evidence_limit、include_debug
+
+本地 Qdrant 访问会加 QDRANT_OPERATION_LOCK：
+
+    backend=qdrant 且没有 qdrant_url
+    -> 同一 Python 进程内串行访问本地 Qdrant 目录
+
+这只能保护单进程；多个进程/多个容器仍不能共享同一个本地 Qdrant 目录。
+
+
+十一、CLI、评测与部署衔接
+--------------------------
+
+主要脚本：
+
+    scripts/build_rag_docs.py
+        仅构建 rag_docs.jsonl + build_report.json
+
+    scripts/build_qdrant_index.py
+        仅从 rag_docs 建 Qdrant 索引 + manifest
+
+    scripts/build_full_rag.py
+        先构建语料，再建索引
+
+    scripts/retrieve_cards.py
+        命令行选择 local / qdrant 检索
+
+    scripts/generate_final_report.py
+        构建最终 package / agent context
+
+    scripts/smoke_test_retrieval.py
+        对 local、Qdrant raw、Qdrant rerank 做基本回归检查
+
+    scripts/generate_nl_test_report.py
+        用固定自然语言 case 生成测试报告
+
+Gateway 会通过 adapter 直接调用 Dual RAG Python API，提供：
+
+    GET /api/dual-rag/health
+    POST /api/dual-rag/retrieve
+    POST /api/dual-rag/agent-context
+    POST /api/dual-rag/build-assets
+
+其中 build-assets 是 Job/Worker 异步写任务；retrieve 和 agent-context 是同步读请求。
+
+
+十二、Docker 与模型缓存
+----------------------
+
+Dockerfile 会在镜像构建阶段：
+
+    预热 thenlper/gte-large
+    + 预热 Qdrant/bm25
+
+缓存位置：
+
+    FASTEMBED_CACHE_PATH=/opt/fastembed_cache
+
+运行时设定：
+
+    HF_HUB_OFFLINE=1
+    TRANSFORMERS_OFFLINE=1
+
+原因：如果把 embedding 模型下载放到容器第一次检索时，受限网络环境可能下载失败或超时；构建期预热后，运行时直接离线读取缓存更稳定。
+
+注意：这缓存的是模型文件，不是每一条文本的 embedding 结果。
+
+
+十三、当前实现边界：哪些不能夸大
+--------------------------------
+
+1. local 不是真实 embedding 检索。
+
+    local 的 dense_score 是 token Counter cosine，不是 gte-large 向量相似度。
+
+2. reranker 不是 Cross-Encoder / LLM 模型。
+
+    当前是候选集内重跑本地 BM25 + 规则的可解释 reranker。
+
+3. Qdrant 默认不是最终裁决器。
+
+    默认 local_hybrid 下，Qdrant 的职责是候选召回；最终排序主要受本地规则影响。
+
+4. 系统没有确认 Qdrant 自动失败降级 local。
+
+    local 是可显式选择的独立 backend，不应说“Qdrant 挂了自动回退”。
+
+5. Agent context 不是最终性能结论。
+
+    它只是按来源、验证、优化、风险组织好的检索证据。
+
+6. 本地 Qdrant 不适合多副本共享。
+
+    本地目录有文件锁；适合单机/单实例。多人或生产多副本应使用远程 Qdrant 服务，并配合外部锁/队列策略。
+
+7. 当前没有 Cross-Encoder、LLM rerank、在线 query rewrite 或向量检索自动评估闭环。
+
+    这些可以是后续演进方向，但不是现有功能。
+
+8. 现有 smoke/natural-language 测试能做基本回归，但不等于已有完整标注集上的 Recall@K、MRR、NDCG 生产质量评估闭环。
+
+
+十四、面试表达模板
+------------------
+
+简版：
+
+“我们把上游结构化知识卡和 Wiki 按 card_id 合成为统一 RAG 文档。检索层保留 local 与 Qdrant 两条路径：local 用 BM25、词频余弦和性能领域规则，作为可解释基线；Qdrant 用 gte-large dense embedding 和 Qdrant/bm25 sparse embedding 做混合候选召回，默认用 DBSF 融合。为了避免向量相似度只看语义接近、忽略性能诊断条件，我们对候选集再执行 local_hybrid 二阶段精排，结合平台、引擎、指标、支持/反证信号、P0、审核状态和 warning 做最终排序。最后将结果回表为含来源、验证步骤、优化动作和风险的 agent_context，供下游归因 Agent 使用。”
+
+被问“为什么不用纯向量检索”时：
+
+“纯向量检索擅长解决自然语言同义表达，但性能诊断有大量结构约束，例如 Android/Unity 范围、low1pct/p99 等指标、GPU 未打满这样的反证、知识卡审核状态和外部工具依赖 warning。我们让 Qdrant 负责高召回候选，再让可解释领域规则负责最终排序，从而兼顾语义召回和诊断可审计性。”
+
+被问“reranker 是什么模型”时：
+
+“当前不是模型。它是 local_hybrid 规则重排：只对 Qdrant 已经召回的候选池重建 BM25，并复用 token cosine、证据对齐、平台/引擎匹配、P0、review、warning 等打分。后续可以升级为 Cross-Encoder 或 LLM rerank，但当前优先选择低成本、可解释、可调试的实现。”
+
+被问“Qdrant 和向量模型的区别”时：
+
+“向量模型负责把文本编码成向量；Qdrant 负责存储向量和 payload、建立索引、执行相似度检索和过滤。项目里 gte-large/Qdrant-bm25 是编码器，Qdrant 是检索数据库。”

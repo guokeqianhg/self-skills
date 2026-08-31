@@ -1,0 +1,1087 @@
+PerfDog Service Gateway：统一网关、MCP、Job 与部署编排详解
+==============================================================
+
+一、先用一句话说清这个项目
+----------------------------
+
+perfdog_service_gateway 不是重新实现知识构建或 RAG 算法的项目。
+
+它是位于两个兄弟工程之上的“统一接入与编排层”，将：
+
+    perfdog_llm_wiki_starter
+        来源登记、抓取、抽卡、校验、Wiki 渲染
+
+    perfdog_dual_rag
+        RAG 语料构建、Qdrant 建库、检索、Agent Context
+
+封装成统一的：
+
+    HTTP REST API
+    + stdio MCP Server
+    + HTTP MCP Endpoint
+    + MySQL Job / Worker 异步任务机制
+
+最准确的项目定位：
+
+    “Gateway 解决的是跨工程调用、协议统一、长任务异步化和共享资产串行写入问题。
+    它负责接入、编排和状态管理；不负责重写上游 ETL 算法，也不负责自己做 RAG 推理。”
+
+
+二、它解决什么问题？
+----------------------
+
+如果没有 Gateway，使用者需要分别：
+
+    手动运行 01~06 上游脚本
+    手动构建 rag_docs
+    手动构建 Qdrant
+    自己区分哪个任务长、哪个任务会改共享文件
+    自己写 HTTP 或 MCP 接口
+
+这会带来问题：
+
+1. 两个子项目的调用方式不同：
+
+    Wiki Starter 是编号 CLI 脚本集合；
+    Dual RAG 是有 Python API 的包。
+
+2. 长任务不适合 HTTP 请求线程直接执行：
+
+    抓取、ASR、LLM 抽卡、校验、Wiki 重渲染、向量建库可能很久；
+    若在 HTTP 请求中同步执行，容易遇到客户端、反向代理或 Ingress 超时。
+
+3. 多个任务可能同时修改共享资产：
+
+    cards_draft.jsonl
+    cards_validated.jsonl
+    wiki/
+    rag_docs.jsonl
+    Qdrant 索引
+
+    如果并发写，可能产生覆盖、半成品或目录锁冲突。
+
+4. Agent、IDE、脚本、Web 后端的接入协议不同：
+
+    普通服务通常调 REST；
+    IDE/Agent 更适合通过 MCP 调 tools；
+    但不希望两套协议各维护一份业务逻辑。
+
+Gateway 的答案是：
+
+    HTTP / MCP 统一接入
+    -> runtime 统一业务分发
+    -> 读操作同步执行
+    -> 写操作写入 MySQL Job
+    -> Worker 异步执行
+    -> lease + heartbeat + MySQL single-writer lock
+    -> 结果、错误、release 状态落库
+
+
+三、整体架构与数据流
+----------------------
+
+    调用方
+      |
+      +-- REST HTTP 客户端
+      +-- IDE / Agent（stdio MCP）
+      +-- 远程 Agent（HTTP MCP）
+      |
+      v
+    perfdog_service_gateway
+      |
+      +-- api.py：REST + HTTP MCP transport
+      +-- mcp.py：stdio MCP transport
+      +-- runtime.py：共同业务入口、工具表、payload 分发
+      |
+      +---------------------------+
+      |                           |
+      v                           v
+    dual_rag adapter          wiki_starter adapter
+      |                           |
+      | 直接 Python 调用           | 白名单 + 固定参数 + subprocess
+      v                           v
+    perfdog_dual_rag         perfdog_llm_wiki_starter
+    检索 / Agent Context     01~06、删卡、可见性切换
+    构建 rag/Qdrant
+      |                           |
+      +-------------+-------------+
+                    |
+                    v
+             workspace_jobs.py
+                    |
+                    v
+        workspace_store.py / MySQL
+        workspace_jobs / asset_releases / cards_index
+                    |
+                    v
+            Worker 轮询、claim、lease、锁、执行
+
+
+四、三个核心概念：REST、MCP、Adapter
+------------------------------------
+
+4.1 REST HTTP API 是什么？
+
+REST 可以简单理解为：
+
+    通过 URL + HTTP 方法 + JSON 请求体调用服务。
+
+例如：
+
+    POST /api/retrieve
+    POST /api/wiki-starter/ingest-source
+    GET  /api/jobs/<job_id>
+
+适合：脚本、后端服务、自动化任务、命令行调试。
+
+
+4.2 MCP 是什么？
+
+MCP（Model Context Protocol）可以理解为：
+
+    让 AI Agent / IDE 以“工具调用”的方式发现和使用服务能力的协议。
+
+Gateway 提供两种 MCP transport：
+
+1. stdio MCP
+
+    本地 IDE 启动一个 Python 进程；
+    客户端通过 stdin/stdout 发送 Content-Length 分帧的 JSON-RPC 消息。
+
+    典型方法：
+
+        initialize
+        tools/list
+        tools/call
+
+2. HTTP MCP
+
+    远程客户端向 POST /mcp 发送 JSON-RPC 2.0 消息；
+    initialize 后从 HTTP response header 获得 session id；
+    后续请求带 session id 和协议版本。
+
+无论 HTTP 还是 MCP，最终都调用同一份 runtime 业务逻辑。
+
+因此不是：
+
+    REST 一套业务代码
+    MCP 再复制一套业务代码
+
+而是：
+
+    REST transport ----+
+                       +-> runtime -> adapter / job
+    MCP transport -----+
+
+
+4.3 Adapter 是什么？
+
+Adapter 是“适配层”，将 Gateway 的统一请求转换为不同子工程能理解的调用方式。
+
+本项目有两类 Adapter：
+
+1. dual_rag adapter
+
+    Dual RAG 已经有 Python 函数 API：
+
+        build_rag_corpus
+        build_qdrant_index
+        build_retrieval_service_payload
+        build_agent_context_service_payload
+
+    所以 Gateway 直接 import 并调用函数。
+
+2. wiki_starter adapter
+
+    Wiki Starter 是 01~06 形式的脚本型工程，没有稳定的服务函数边界。
+
+    所以 Gateway 不让 HTTP 输入自由执行 shell 命令，而是：
+
+        task 白名单
+        -> 每个 task 有固定 script
+        -> 每个 task 有固定参数构造函数
+        -> subprocess.run
+        -> timeout、stdout/stderr 截断
+        -> 产物摘要与必要的业务成功核验
+
+这体现的设计取舍：
+
+    对已包化模块采用库级调用；
+    对遗留/脚本型模块采用受控子进程编排；
+    不为了服务化强行大改已有 ETL。
+
+
+五、HTTP API：有哪些路由，读写如何区分？
+-----------------------------------------
+
+核心文件：
+
+    src/perfdog_service_gateway/api.py
+    src/perfdog_service_gateway/runtime.py
+
+5.1 读接口：同步返回
+
+以下接口在 HTTP 请求线程内同步执行：
+
+    GET /healthz
+    GET /api/workspace/overview
+    GET /api/dual-rag/health
+    GET /api/wiki-starter/status
+    GET /api/releases/active
+    GET /api/jobs/<job_id>
+
+    POST /api/retrieve
+    POST /api/dual-rag/retrieve
+    POST /api/agent-context
+    POST /api/dual-rag/agent-context
+
+其中 retrieve / agent-context 会调用 Dual RAG 检索；它们是读操作，不改 cards/wiki/rag/Qdrant，所以同步返回。
+
+
+5.2 写接口：先入队，不等于已经完成
+
+以下接口当前实际是异步 Job：
+
+    POST /api/dual-rag/build-assets
+    POST /api/wiki-starter/run-task
+    POST /api/wiki-starter/ingest-source
+    POST /api/wiki-starter/delete-cards
+    POST /api/wiki-starter/set-rag-visibility
+
+HTTP 响应类似：
+
+    {
+      "success": true,
+      "queued": true,
+      "operation": "wiki_starter.ingest_source",
+      "job": {
+        "job_id": "UUID",
+        "job_type": "wiki.ingest_source",
+        "status": "queued"
+      }
+    }
+
+最容易说错的点：
+
+    HTTP 200 + queued=true
+    不等于资料已抓取、卡片已生成、Wiki 已更新或 Qdrant 已建完。
+
+正确使用流程：
+
+    POST 写接口
+    -> 拿到 job_id
+    -> GET /api/jobs/<job_id>
+    -> status=succeeded 才表示任务成功
+    -> 查看 job.result / error / published_release
+
+
+5.3 HTTP body 与错误处理
+
+普通 REST POST 请求：
+
+- 读取 Content-Length；
+- body 为空时视为 {}；
+- 必须是 UTF-8 JSON object；
+- JSON 无法解析、Content-Length 非法、body 不是 object、业务 ValueError：HTTP 400；
+- 未找到路由：HTTP 404；
+- 未捕获异常：HTTP 500；
+- 普通错误主体通常是：
+
+    {
+      "success": false,
+      "error": "错误文本"
+    }
+
+当前有限之处：
+
+- 没有稳定 error_code；
+- 没有 trace_id；
+- 没有字段级 error array；
+- 主要依赖 HTTP status + success + error 文本。
+
+
+六、MCP：stdio 和 HTTP MCP 如何工作？
+--------------------------------------
+
+核心文件：
+
+    src/perfdog_service_gateway/mcp.py
+    src/perfdog_service_gateway/api.py
+    src/perfdog_service_gateway/runtime.py
+
+6.1 stdio MCP
+
+启动：
+
+    python perfdog_service_gateway/scripts/serve_mcp.py
+
+消息格式：
+
+    Content-Length: <字节数>
+    Content-Type: application/json
+
+    {"jsonrpc":"2.0", ...}
+
+支持：
+
+    initialize
+    initialized
+    ping
+    tools/list
+    tools/call
+
+tools/call 最终调用：
+
+    runtime.call_mcp_tool(tool_name, arguments)
+
+工具执行结果会包装成 MCP Tool Result：
+
+    {
+      "content": [{"type":"text", "text":"格式化后的业务 JSON"}],
+      "structuredContent": {业务 JSON},
+      "isError": false 或 true
+    }
+
+注意：业务失败不一定是 JSON-RPC error。
+
+例如工具返回：
+
+    {"success": false, "error": "..."}
+
+MCP 仍可能用 JSON-RPC result 包装，只是：
+
+    isError=true
+
+JSON-RPC error 主要用于协议错误，例如：
+
+    -32700 JSON parse error
+    -32600 invalid request
+    -32601 method not found
+    -32603 internal error
+
+
+6.2 HTTP MCP
+
+HTTP MCP 入口：
+
+    POST /mcp
+    DELETE /mcp
+
+调用步骤：
+
+1. initialize
+
+    POST /mcp
+    body 是 JSON-RPC initialize request
+
+    服务返回：
+
+        Mcp-Session-Id: <随机 session id>
+        MCP-Protocol-Version: <协商版本>
+
+2. 后续 tools/list、tools/call
+
+    每次 POST /mcp 都必须带：
+
+        Mcp-Session-Id
+        MCP-Protocol-Version
+
+3. DELETE /mcp
+
+    带 Mcp-Session-Id，服务删除会话，返回 204。
+
+HTTP MCP 当前特点：
+
+- 支持单 endpoint + session header；
+- 响应实际为 application/json；
+- 不提供 SSE 流；
+- GET /mcp 返回 405；
+- session 存在 Python 进程内存 dict，用 threading.Lock 保护。
+
+因此它不适合直接横向扩容为多个无状态副本：
+
+    请求 A initialize 到副本 1
+    请求 B tools/call 被负载均衡到副本 2
+    -> 副本 2 没有 session
+    -> session not found
+
+生产化需要：会话粘滞，或使用 Redis/数据库等共享 session store。
+
+
+七、MCP 暴露的九个工具
+----------------------
+
+runtime.py 定义并统一分发以下 9 个工具：
+
+1. perfdog_workspace_health
+
+    工作区总体健康检查。
+
+2. perfdog_retrieve_knowledge
+
+    结构化检索现象、根因、验证、优化证据。
+
+3. perfdog_build_agent_context
+
+    检索后构造 Agent 可消费的 agent_context。
+
+4. perfdog_dual_rag_build_assets
+
+    构建 corpus / qdrant / full RAG 资产。写任务，返回 queued Job。
+
+5. perfdog_wiki_starter_get_status
+
+    查询上游 Wiki Starter 的资产、来源表和支持任务状态。
+
+6. perfdog_wiki_starter_run_task
+
+    执行白名单中的单个上游脚本任务。写任务，返回 queued Job。
+
+7. perfdog_wiki_starter_ingest_source
+
+    单 URL 全链路：add_source -> 抓取分流 -> 03 -> 04 -> 05 -> 06。写任务。
+
+8. perfdog_wiki_starter_delete_cards
+
+    按 card_id/source_id 删除卡片，并对受影响来源重渲染 Wiki。写任务。
+
+9. perfdog_wiki_starter_set_rag_visibility
+
+    不删除卡，只切换 rag_excluded；默认会重建相关 RAG 语料。写任务。
+
+工具 schema 的价值：给 MCP Client 说明字段类型、枚举、默认语义和 additionalProperties=false 约束。
+
+但要注意：
+
+    MCP inputSchema 是工具描述合同；
+    REST api.py 本身没有通用 JSON Schema validator。
+
+真正的参数归一与校验分散在 adapter / dual_rag service facade 中。
+
+
+八、Runtime：为什么它是业务总入口？
+------------------------------------
+
+核心文件：
+
+    src/perfdog_service_gateway/runtime.py
+
+runtime 的职责：
+
+    HTTP / MCP 请求
+    -> 对应 build_*_payload 函数
+    -> 同步 read adapter，或 enqueue write job
+    -> 统一 service / operation 元信息
+
+例如：
+
+    HTTP POST /api/retrieve
+    -> build_retrieval_service_payload
+    -> dual_rag adapter
+    -> perfdog_dual_rag service facade
+
+    MCP tools/call(perfdog_retrieve_knowledge)
+    -> call_mcp_tool
+    -> 同一个 build_retrieval_service_payload
+
+因此 REST 与 MCP 是“不同 transport，共享业务实现”。
+
+runtime 同时维护：
+
+    MCP_TOOL_DEFINITIONS
+    _TOOL_HANDLERS
+
+未找到的 MCP tool 不会直接抛异常，而会返回：
+
+    {"success": false, "error": "未知工具：..."}
+
+
+九、Job：为什么要有 MySQL Job / Worker？
+-----------------------------------------
+
+核心文件：
+
+    perfdog_service_gateway/src/perfdog_service_gateway/workspace_jobs.py
+    perfdog_llm_wiki_starter/scripts/workspace_store.py
+    perfdog_service_gateway/scripts/serve_worker.py
+
+9.1 Job 是什么？
+
+Job 是 MySQL workspace_jobs 表中的一条异步工作记录。
+
+五种写任务类型：
+
+    dual_rag.build_assets
+    wiki.run_task
+    wiki.ingest_source
+    wiki.delete_cards
+    wiki.set_rag_visibility
+
+一条 Job 的核心字段：
+
+    job_id              UUID
+    job_type            任务类型
+    status              queued / running / succeeded / failed
+    payload_json        原始请求参数
+    result_json         成功结果或附加结果
+    error_text          失败文本
+    requested_by        请求者标识
+    worker_id           当前处理 Worker
+    attempts            成功 claim 次数
+    publish_release     是否需要发布
+    created_at
+    updated_at
+    started_at
+    finished_at
+    lease_expires_at
+
+9.2 Job 状态机
+
+    enqueue_job
+      -> queued
+
+    claim_next_job
+      -> running
+      + worker_id
+      + started_at
+      + lease_expires_at
+      + attempts += 1
+
+    heartbeat_job
+      -> 保持 running
+      + 延长 lease_expires_at
+
+    complete_job
+      -> succeeded
+      + result_json
+      + finished_at
+      + lease=null
+
+    fail_job
+      -> failed
+      + error_text
+      + result_json
+      + finished_at
+      + lease=null
+
+    running job lease 过期
+      -> 下一次 claim_next_job 时扫描
+      -> queued
+      + worker_id=null
+      + started_at=null
+      + lease=null
+
+9.3 Lease / Heartbeat 是什么？
+
+Lease 可以理解为：
+
+    “某个 Worker 临时拥有这个 Job 的处理权，直到某个过期时间。”
+
+当前默认：
+
+    lease = 300 秒
+    heartbeat interval = 60 秒
+
+Worker 开始执行时先写一次 heartbeat，然后启动 daemon thread，每 60 秒刷新一次 lease。
+
+目的：
+
+- Worker 正常工作：持续续租，其他 Worker 不会重复执行；
+- Worker 崩溃：不再 heartbeat；
+- lease 超时：后续 Worker claim 时将任务重新入队，避免永久卡死。
+
+细节：
+
+- heartbeat 只在 job_id、status=running、worker_id 都匹配时更新；
+- 这防止旧 Worker 在 Job 已被重新领取后仍错误续租；
+- 过期 Job 并不是实时后台扫描，而是在下一次 claim_next_job 时检查和 requeue；
+- attempts 是被 claim 的次数，不代表有完整的自动 retry 策略。
+
+9.4 当前是否有自动重试和幂等？
+
+必须准确说：
+
+- 没有 HTTP Idempotency-Key；
+- 重复 POST 可能创建不同 job_id，造成重复执行；
+- 没有统一的“失败后指数退避 + 最大重试次数” Job 策略；
+- Worker 崩溃后的 lease 过期 requeue 是恢复机制，不等于业务幂等；
+- 上游抓取脚本自身可能有重试（例如 Firecrawl），那是任务内部重试，和 Job 重试不是一回事。
+
+
+十、为什么还要 MySQL Single Writer Lock？
+-------------------------------------------
+
+Lease 解决的是“一个 Job 被哪个 Worker 领取”。
+
+但不同 Job 可能同时被不同 Worker 领取，例如：
+
+    Job A：ingest_source，正在改 cards_validated.jsonl
+    Job B：build-assets，正在读/写 rag_docs/Qdrant
+
+这仍可能互相干扰。
+
+因此 run_single_job() 对所有 WRITE_JOB_TYPES 获取 MySQL：
+
+    GET_LOCK('perfdog_workspace_single_writer')
+
+当前 lock 获取等待：
+
+    5 秒
+
+执行结束后在 finally 中：
+
+    RELEASE_LOCK(...)
+
+作用：
+
+    同一时间只允许一个写任务修改共享 cards/wiki/rag/qdrant 资产。
+
+注意：
+
+- 这是工作区级粗粒度锁，优先正确性，不追求写并发吞吐；
+- 读检索请求不进 Job，也不拿这个 MySQL 写锁；
+- 本地 Qdrant 还需要自身的目录访问限制；
+- 若未来要扩展并发，应按资源拆锁/拆队列，而不是简单删锁。
+
+
+十一、Worker 的真实执行流程
+----------------------------
+
+Worker 启动：
+
+    python perfdog_service_gateway/scripts/serve_worker.py --poll-interval 2.0
+
+默认每 2 秒轮询一次。
+
+一次迭代：
+
+    claim_next_job(worker_id, lease_seconds=300)
+    -> 没有 Job：sleep
+    -> 有 Job：run_single_job
+
+run_single_job：
+
+    1. 判断 job_type 是否属于 WRITE_JOB_TYPES；
+    2. 获取 MySQL single-writer lock；
+    3. 启动 lease heartbeat 线程；
+    4. 根据 job_type 调用对应 adapter；
+    5. 刷新 draft / validated 的 cards_index；
+    6. 满足条件时执行 follow-up publish；
+    7. 成功：complete_job；异常：fail_job；
+    8. finally 释放写锁。
+
+重点：
+
+    worker 的成功/失败是 Job 层成功；
+    上游 pipeline 是否真正产出卡片，仍取决于 adapter 的阶段核验。
+
+
+十二、Release 与 cards_index：Gateway 额外维护了什么？
+-------------------------------------------------------
+
+12.1 cards_index
+
+workspace_store.py 会创建 cards_index 表，将 draft / validated JSONL 中的卡做可查询索引。
+
+索引包含：
+
+    dataset、release_id、card_id、source_id、card_type、title、canonical_key、
+    review_status、rag_excluded、platforms_text、search_text、card_json 等。
+
+Worker 每次写任务后调用 _refresh_live_cards_indexes：
+
+    draft -> draft-live
+    validated -> validated-live
+
+目的：让 Webapp/管理功能能较方便地按标题、来源、类型、平台、审核状态、RAG 可见性查询卡片。
+
+12.2 asset_releases
+
+asset_releases 表记录：
+
+    release_id
+    status（active / retired）
+    cards_path
+    wiki_path
+    rag_docs_path
+    build_report_path
+    qdrant_path / qdrant_url
+    collection_name
+    metadata_json
+    created_by
+    published_at
+
+Dual RAG build 在 publish_release=true 时可创建 release：
+
+    project_root/releases/<release_id>
+
+并在 asset_releases 中：
+
+    先把旧 active 标记为 retired
+    -> 新 release 标为 active
+
+12.3 一个容易误解的边界
+
+不能说当前 release 是“全量不可变快照”。
+
+原因：
+
+- release 表主要记录路径与元数据；
+- cards/wiki 的路径不一定都被复制进新的 release 目录；
+- 很多输入仍在共享 volume 中实时变化。
+
+准确说法：
+
+    “当前 release 提供 active 资产路径与构建版本元数据切换；
+    对 Qdrant/输出目录有版本化发布意图，但还不是完整不可变工件仓库。”
+
+
+十三、Wiki Starter Adapter：如何安全执行脚本？
+------------------------------------------------
+
+核心文件：
+
+    adapters/wiki_starter.py
+
+13.1 为什么需要白名单？
+
+如果 API 允许用户传：
+
+    {"command": "任意 shell 命令"}
+
+那就是命令注入风险。
+
+当前代码只允许固定 task：
+
+    add_source
+    build_sources
+    scrape_sources
+    fetch_video_transcripts
+    retry_failed_fetches
+    validate_scrapes
+    extract_cards
+    validate_cards
+    render_wiki
+    delete_cards
+    set_rag_visibility
+
+Gateway 根据 task 查 TASK_DEFINITIONS，再调用对应 command builder。HTTP 输入不能直接决定可执行脚本路径。
+
+13.2 单任务 run_wiki_starter_task
+
+执行步骤：
+
+    payload
+    -> task 是否在白名单
+    -> 构建固定 Python command 与 artifacts 路径
+    -> 检查 starter 根目录、脚本存在、API Key 等 prerequisite
+    -> 加 _TASK_RUN_LOCK（同进程串行）
+    -> subprocess.run(capture_output=true, timeout=...)
+    -> 截断 stdout/stderr
+    -> 返回 execution + artifacts summary
+
+execution 中包括：
+
+    command
+    cwd
+    exit_code
+    timed_out
+    duration_seconds
+    serialized
+    stdout
+    stderr
+
+注意：单任务 success 基本等于：
+
+    subprocess returncode == 0
+
+这不必然等于“某个 source 真的有业务产物”。
+
+13.3 为什么 ingest pipeline 要再做业务核验？
+
+批处理脚本可能发生：
+
+    脚本整体 return code=0
+    但某一条 source 抓取失败 / 校验失败 / 没抽出卡
+
+因此 run_ingest_source_pipeline 在每个阶段后检查真实结果：
+
+    抓取：MySQL fetch.status 是否 scraped / validated；
+    正文校验：fetch.status 是否 validated；
+    抽卡：cards_draft.jsonl 是否出现该 source_id；
+    卡片校验：cards_validated.jsonl 是否出现该 source_id。
+
+这避免“每一步进程都成功，但新来源实际上没有进入知识库”的假成功。
+
+13.4 ingest_source 的真实流程
+
+    add_source
+    -> 从 stdout JSON 解析 source_id
+    -> 查询 MySQL fetch.strategy
+    -> firecrawl：scrape_sources
+       或 video_transcript_first：fetch_video_transcripts
+    -> validate_scrapes
+    -> extract_cards
+    -> validate_cards
+    -> render_wiki
+
+默认：
+
+    continue_on_error=false
+
+即 fail-fast：任意阶段失败立即返回，后续不跑。
+
+传 continue_on_error=true 后，全部阶段仍会尽量执行，最后用 stages 结果判断 overall success。
+
+13.5 ingest 的 RAG 重建：必须区分调用面
+
+直接 Python 调用 run_ingest_source_pipeline：
+
+    rebuild_rag 默认 false
+
+含义：只更新 sources/cards/Wiki，不重建 rag_docs/Qdrant。
+
+但是通过 HTTP/MCP 进入 Job 时：
+
+    enqueue wiki.ingest_source 默认 publish_release=true
+    Worker 成功后会 _follow_up_publish
+    -> build_dual_rag_assets(build_mode='full', publish_release=true)
+
+所以不能笼统说：
+
+    “Gateway ingest 默认不重建 RAG。”
+
+准确说法：
+
+    “直接 adapter pipeline 默认不重建；但当前 Gateway 的成功 ingest Job 默认会触发一次 full follow-up publish。
+    最终应以 Job result.published_release / reports 判断是否真正构建发布。”
+
+13.6 delete_cards 和 set_rag_visibility
+
+delete_cards：
+
+    删除 draft/validated 中命中的 card；
+    从脚本 stdout 解析 affected_source_ids；
+    对受影响来源增量 render_wiki；
+    直接 pipeline 的 rebuild_rag 默认 false；
+    Gateway Job 成功后可能 follow-up full publish。
+
+set_rag_visibility：
+
+    修改 rag_excluded；
+    不删除卡、不影响 Wiki；
+    直接 pipeline 的 rebuild_rag 默认 true，默认 corpus；
+    可选 full 同时重建 Qdrant；
+    Gateway Job 成功后可能 follow-up full publish。
+
+
+十四、Dual RAG Adapter：为什么直接调用函数？
+---------------------------------------------
+
+核心文件：
+
+    adapters/dual_rag.py
+
+Dual RAG 已经是 Python 包，因此 Gateway 可直接：
+
+    import build_rag_corpus
+    import build_qdrant_index
+    import build_retrieval_service_payload
+    import build_agent_context_service_payload
+
+而不需为每次检索启动子进程。
+
+其职责：
+
+- 使用 active release 为未指定路径填默认值；
+- 处理 corpus / qdrant / full build_mode；
+- 为发布构造 release_id；
+- publish_release=true 时使输出落到 releases/<release_id>；
+- 本地 Qdrant 操作使用 QDRANT_OPERATION_LOCK；
+- 成功时写 asset_releases 并更新 validated cards_index。
+
+注意：
+
+    只有 build adapter 实际收到 payload.publish_release=true，才会创建 active release。
+
+而 Job 行中的 publish_release=true 不自动注入 adapter payload。对于 dual_rag.build_assets Job，不存在 Worker follow-up publish 分支。因此应看：
+
+    job.result.published_release
+
+不能只看 Job 表的 publish_release 字段就认定已发布。
+
+
+十五、Docker 与 Compose：Gateway 如何部署
+------------------------------------------
+
+核心文件：
+
+    根目录 Dockerfile
+    根目录 docker-compose.yml
+    docker-compose.shared-mysql.yml
+    scripts/seed_runtime_assets.py
+
+15.1 Dockerfile 做了什么？
+
+1. 基础镜像：
+
+    python:3.11-slim
+
+2. 安装 libgomp1；
+
+3. 复制三个项目 requirements 并安装 Gateway requirements（其会递归带入所需依赖）；
+
+4. 复制整个工作区代码；
+
+5. 将 Wiki Starter data/wiki 与 Dual RAG data 打为 /opt/perfdog-seed 下的 tar 包；
+
+6. 设置 PYTHONPATH，让 gateway 与 dual-rag src 可被 import；
+
+7. 在构建期预下载：
+
+    thenlper/gte-large
+    Qdrant/bm25
+
+    预热到：
+
+        /opt/fastembed_cache
+
+8. 运行期设置：
+
+    HF_HUB_OFFLINE=1
+    TRANSFORMERS_OFFLINE=1
+
+    目的：部署后的第一次检索不再因临时下载 embedding 模型而卡住。
+
+9. 默认启动：
+
+    serve_api.py --host 0.0.0.0 --port 8787
+
+15.2 docker-compose.yml 启动什么？
+
+一条命令：
+
+    docker compose up --build -d
+
+会编排：
+
+    mysql
+    qdrant
+    app（Gateway HTTP + HTTP MCP）
+    worker（后台 Job Worker）
+    webapp（来源/卡片管理）
+
+服务发现：
+
+    MYSQL_HOST=mysql
+    QDRANT_URL=http://qdrant:6333
+
+这里 mysql、qdrant 是 Compose 服务名，不是宿主机 IP。
+
+app / worker / webapp 共用同一镜像：
+
+    perfdog-workspace-gateway
+
+仅 command 不同：
+
+    app：默认 CMD，启动 API；
+    worker：serve_worker.py；
+    webapp：webapp/app.py。
+
+好处：代码和依赖版本一致，不维护三份 Dockerfile。
+
+15.3 启动依赖与持久化
+
+- MySQL 有 healthcheck；
+- app / worker / webapp 等 MySQL healthy 后启动；
+- Qdrant 等 service_started；
+- 命名 volume 保存：
+
+    MySQL 数据
+    Wiki Starter data
+    Wiki 页面
+    Dual RAG data
+    Qdrant storage
+
+所以：
+
+    docker compose down
+
+通常不会删 volume；
+
+    docker compose down -v
+
+才会连持久化数据一起删除。
+
+15.4 shared MySQL Compose 与 asset seed
+
+docker-compose.shared-mysql.yml 用于团队共享环境：
+
+- 不启动本地 MySQL；
+- app/worker/webapp 连外部共享 MySQL；
+- asset_seed 容器运行 seed_runtime_assets.py；
+- 仅当挂载的 data/wiki/rag 目录为空时，将镜像 /opt/perfdog-seed 中的初始资产解压到持久卷；
+- 防止“volume 覆盖镜像中已有数据”导致首次部署看不到已有知识资产。
+
+seed 脚本会校验 tar 解压路径，避免 path traversal。
+
+
+十六、当前限制：面试时必须诚实说明
+------------------------------------
+
+1. 没有鉴权 / RBAC
+
+当前任何能访问端口的人都可调用删卡、抓取、建库等写操作。
+
+2. CORS 是 Access-Control-Allow-Origin: *
+
+适合本地开发，不应直接暴露公网。
+
+3. 任务白名单不是完整沙箱
+
+虽然 task 名不能任意执行，但部分 payload 可传 starter_root、project_root、输入输出路径；当前没有强制路径必须在 workspace 根目录内。
+
+4. HTTP MCP session 在进程内
+
+没有共享 session、没有 TTL 清理、多副本需会话粘滞。
+
+5. Job 不是完整工作流引擎
+
+有 queued/running/succeeded/failed、lease、heartbeat、锁；
+但没有 Idempotency-Key、统一 retry policy、回调、SSE progress、阶段事件或 trace id。
+
+6. local Qdrant 不适合多副本共享
+
+本地目录模式有锁冲突；单进程 lock 不能解决跨容器问题。共享/生产应使用远程 Qdrant。
+
+7. release 不是完整不可变快照
+
+当前更像“active 资产路径与构建元数据发布”，不是一个所有 cards/wiki/rag 都彻底复制冻结的工件系统。
+
+8. 标准库 ThreadingHTTPServer 是轻量实现
+
+没有生产级 TLS、限流、认证、请求体大小限制、统一 schema validation、中间件、优雅 shutdown 或可观测性。
+
+9. README 中的部分早期说法可能过时
+
+特别是“长任务同步 HTTP”描述与当前 API -> Job -> Worker 代码不一致。面试时应以当前代码为准。
+
+
+十七、面试表达模板
+------------------
+
+简版：
+
+“我们在两个子工程之上增加了统一 Gateway。它对外同时提供 REST、stdio MCP 和 HTTP MCP，但三种协议最终复用同一份 runtime 分发逻辑。读取检索和 Agent Context 是同步调用 Dual RAG；抓取、抽卡、删卡、RAG 建库等写操作会落到 MySQL Job 队列，由 Worker 通过 300 秒 lease、60 秒 heartbeat 和 MySQL single-writer lock 异步串行执行。对于已包化的 Dual RAG，Gateway 直接调用 Python API；对于脚本型 Wiki Starter，则使用 task 白名单和固定参数构造子进程，并在 ingest pipeline 中额外核验真实产物，避免 exit code=0 但没有卡片的假成功。Docker Compose 可以一键启动 MySQL、Qdrant、Gateway、Worker 和 Webapp。”
+
+被问“为什么同时支持 HTTP 和 MCP？”
+
+“HTTP 适合后端、脚本和自动化系统；MCP 适合 IDE/Agent 以工具方式发现和调用能力。我们让它们共享 runtime，而不是复制业务逻辑，避免两种协议行为漂移。”
+
+被问“为什么要 Job / lease？”
+
+“因为抓取、LLM 抽卡、Wiki 渲染和建向量库是长且会改共享资产的任务。HTTP 只负责快速返回 job_id；Worker claim 后通过 lease 声明处理权并 heartbeat 续租，崩溃后过期任务能重新入队；单写锁避免多个写任务同时改 cards/wiki/rag/Qdrant。”
+
+被问“它已经是生产级网关了吗？”
+
+“不是。当前是统一服务与工作区编排层，已有 API/MCP、异步 Job、lease、锁和 Compose 部署；但无鉴权、无幂等键、无事件流、MCP session 在内存，本地 Qdrant 不支持多副本共享。生产化下一步是 API Gateway/JWT/RBAC、Idempotency-Key、统一 retry/trace、远程 Qdrant 和共享 session store。”

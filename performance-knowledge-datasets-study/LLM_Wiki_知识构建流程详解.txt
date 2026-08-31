@@ -1,0 +1,888 @@
+
+一、先说结论：它是不是“Agent”？
+-----------------------------
+
+严格说，perfdog_llm_wiki_starter 不是一个会自主规划、选择工具、观察结果后反复调整计划的 Autonomous Agent。
+
+它更准确的定位是：
+
+    一个由 LLM 参与的、可审计的知识 ETL（Extract-Transform-Load）/ Wiki 构建流水线。
+
+其中：
+
+- Python 规则负责：来源登记、抓取策略选择、重试、质量门禁、字段归一、状态回写、持久化、Wiki 渲染；
+- LLM 负责：从已校验正文中提取结构化知识卡，以及给少量规则难判断的边界卡做固定枚举的语义标签；
+- 人工负责：来源是否启用、优先级、是否进入 Wiki、人工标题/指标覆盖，以及最终必要的知识审核；
+- 下游 dual_rag / Agent 负责：消费知识卡与 Wiki，检索证据，并据此进行归因或报告生成。
+
+因此，面试最准确的说法是：
+
+    “我们实现的是 LLM 驱动的知识资产构建流水线，而非让 LLM 自主循环调用工具的 Agent。
+    模型被限制在两个受控节点：结构化抽卡与边界语义标签；流程控制和质量治理仍由可复现的确定性代码完成。”
+
+
+二、它要解决什么问题？
+----------------------
+
+原始性能资料通常来自：
+
+- PerfDog 官方文档；
+- Unity / Unreal / Android / iOS 等技术文档；
+- 性能优化文章与案例；
+- Bilibili 技术视频；
+- 团队整理的专家链接清单。
+
+这些资料存在几个问题：
+
+1. 格式不统一：网页、视频、长文、案例、说明书混在一起；
+2. 质量不稳定：可能抓到 404、验证码页、广告、无正文页面、错误字幕；
+3. 原始文本不适合直接做性能诊断：缺少明确的现象、根因、验证、优化、反证结构；
+4. 单纯“网页 -> embedding -> 向量库”难治理：无法明确每条结论的来源、适用条件、风险和验证路径；
+5. 资料更新后需要可重跑、可审计、可人工修正，而不是一次性黑盒处理。
+
+所以项目将资料逐层加工：
+
+    原始链接
+    -> 来源注册与人工治理
+    -> 原始抓取资产与清洗正文
+    -> 结构化知识卡
+    -> 已校验知识卡与 Markdown Wiki
+    -> 下游 RAG 文档与向量索引
+    -> 给归因 Agent 使用的结构化证据包
+
+它的最终价值不是直接替人下“性能根因结论”，而是提供可追溯、可验证的知识证据底座。
+
+
+三、整体架构：一条资料如何走完整链路
+--------------------------------------
+
+    输入 A：专家资料 Markdown 清单
+    输入 B：单条 URL
+                  |
+                  v
+    01 来源解析、URL 归一化、自动元数据初判（Python 规则）
+                  |
+                  v
+    MySQL sources 表：运行时来源真源
+                  |
+                  +--> Webapp 人工编目：启用、优先级、Wiki 可见性、人工覆盖
+                  |
+                  v
+    02 网页抓取（Firecrawl）
+      或
+    02b 视频字幕获取（字幕/API）-> 音频/ASR 兜底
+                  |
+                  v
+    data/raw + data/meta + data/markdown
+                  |
+                  v
+    03 正文质量校验（Python 规则）
+                  |
+                  v
+    04 LLM 分块抽取结构化知识卡 + Pydantic 校验
+                  |
+                  v
+    data/cards/cards_draft.jsonl + extract_usage.jsonl
+                  |
+                  v
+    05 规则校验 + 批量 LLM 轻量语义标签 + 优先级/告警
+                  |
+                  v
+    data/cards/cards_validated.jsonl + 校验报告/语义缓存
+                  |
+                  v
+    06 Markdown Wiki 渲染
+                  |
+                  v
+    wiki/index.md + wiki/index_core.md + 按卡片类型分类页面
+                  |
+                  v
+    下游 perfdog_dual_rag：rag_docs.jsonl -> Qdrant -> Agent context
+
+
+四、阶段 01：来源登记与自动初判
+--------------------------------
+
+核心文件：
+
+    scripts/01_build_sources.py
+    scripts/01b_add_single_source.py
+    scripts/registry_db.py
+    webapp/app.py
+
+4.1 输入是什么？
+
+- 批量输入：根目录“专家知识库资料链接清单.md”；
+- 单条输入：一个 URL，可附标题、章节提示、人工备注等。
+
+4.2 代码做了什么？
+
+(1) URL 归一化
+
+normalize_source_url(url) 会统一 URL 表示，例如：
+
+- scheme / host 转小写；
+- query 参数排序；
+- 去掉 fragment（# 后内容）；
+- 去掉无意义的末尾 /。
+
+目的：同一篇资料即使链接写法略有不同，也尽量被识别为同一来源，避免重复入库。
+
+(2) 稳定 source_id
+
+make_source_id(url) 使用“规范化 URL 的 SHA-1 前 10 位”生成：
+
+    SRC-XXXXXXXXXX
+
+所以 source_id 是可重复计算的稳定标识，不是每次新增时随机生成 UUID。
+
+(3) 自动元数据初判
+
+通过 URL、标题、Markdown 章节上下文和关键词规则推断：
+
+- platforms：Android / iOS / Windows / Cross-platform；
+- engines：Unity / Unreal Engine 等；
+- categories：CPU、GPU、内存、温控、I/O 等根因分类；
+- topics：帧率、Jank、渲染、功耗等主题；
+- mapped_metrics：可能关联的 PerfDog 结构化指标；
+- fetch.strategy：抓取策略。
+
+其中，Bilibili `/video/` 会被标成：
+
+    video_transcript_first
+
+其它普通网页一般走：
+
+    firecrawl
+
+注意：这些都是关键词/规则推断，不是 LLM 自动分类。后续允许人工覆盖。
+
+4.3 为什么要存 MySQL？
+
+MySQL 的 sources 表是“运行时来源真源”，保存：
+
+- 来源 URL、source_id、自动标签；
+- 人工编目字段；
+- 抓取状态、错误、资产路径；
+- 审核状态等。
+
+JSONL/Excel 历史文件可以作为迁移快照或排障参考，但不再是日常真源。
+
+4.4 人工编目做什么？
+
+Webapp 支持人工维护：
+
+- enabled：是否允许纳入处理流程；
+- ingestion_priority：P0 / P1；
+- include_in_wiki：是否进入 Wiki；
+- title_override：人工标题覆盖；
+- mapped_metrics_override：人工指标覆盖；
+- notes：收录/审核说明。
+
+设计重点：自动推断字段与人工字段分离。重复运行 01 同步清单时，只刷新自动字段，不覆盖人工决策、抓取状态和审核状态。
+
+并发方面：来源人工编辑使用乐观锁/版本校验，避免两个人修改时静默互相覆盖。
+
+
+五、阶段 02：抓取与文本资产沉淀
+--------------------------------
+
+核心文件：
+
+    scripts/02_scrape_sources.py
+    scripts/02b_fetch_video_transcripts.py
+    scripts/02c_retry_failed_fetches.py
+    scripts/scrape_cleaning.py
+
+5.1 网页抓取：Firecrawl
+
+普通网页来源由 02 处理，调用 Firecrawl：
+
+    https://api.firecrawl.dev/v2/scrape
+
+请求意图：
+
+- 获取 markdown 和 html；
+- onlyMainContent=true，只取正文；
+- removeBase64Images=true；
+- blockAds=true。
+
+抓取成功后会写三类可追溯资产：
+
+    data/raw/<source_id>.json
+        Firecrawl 原始返回，便于排障和追溯。
+
+    data/meta/<source_id>.json
+        页面标题、HTTP status、content type 等元信息。
+
+    data/markdown/<source_id>.md
+        清洗后的正文，是后续 03/04 的主输入。
+
+同时将 fetch 状态写回 MySQL，例如：
+
+    status=scraped
+    fetched_at
+    content_sha256
+    content_chars
+    markdown_path
+    metadata_path
+    raw_path
+    http_status
+    last_error
+
+5.2 网页抓取的重试
+
+02 对以下问题会重试：
+
+- 网络请求异常；
+- HTTP 429；
+- HTTP 5xx；
+- Firecrawl 返回 success=false；
+- 清洗后的正文少于 200 字符。
+
+默认最多 3 次，使用指数退避加随机抖动：
+
+    sleep(min(60, 2^attempt + random()))
+
+如果单条来源最终失败：
+
+- 清理本条旧抓取资产；
+- 回写 failed_firecrawl 和 last_error；
+- 继续处理下一条来源，而不是因为一条资料失败终止整个批次。
+
+5.3 视频抓取：字幕优先，ASR 兜底
+
+视频来源不直接走普通网页抓取，而是走 02b：
+
+    官方/播放器字幕
+    -> Bilibili 页面或 API 备用路径
+    -> 若仍无字幕，下载音频
+    -> ffmpeg 转 WAV
+    -> 必要时音频分片
+    -> Whisper 或 OpenAI-compatible ASR
+
+这条链路的目标是“获得可用于知识构建的文本”，不是做视频画面理解。
+
+视频结果同样落：
+
+    raw / meta / markdown
+
+Markdown 中会包含：
+
+    ## Transcript
+
+5.4 失败重试分流：02c
+
+02c 不会把所有失败来源一股脑重试成网页抓取。它读取 MySQL 中已经记录的：
+
+    fetch.strategy
+
+然后：
+
+- firecrawl 来源回到 02；
+- video_transcript_first 来源回到 02b。
+
+这样不会破坏来源最初的抓取策略。
+
+
+六、阶段 03：正文质量校验（不调用 LLM）
+-----------------------------------------
+
+核心文件：
+
+    scripts/03_validate_scrapes.py
+
+这一步的目的：先过滤低质量输入，再把 LLM 调用成本花在可信正文上。
+
+规则包括：
+
+1. Markdown 是否存在；
+2. 正文长度是否达标，默认最小 600 字符；
+3. 是否命中错误页模式：
+   - 404；
+   - access denied；
+   - captcha；
+   - robot check；
+   - 页面不存在；
+   - 访问被拒绝；
+   - 采购/套餐页面等；
+4. 长文本没有标题，可能说明抓取异常；
+5. 计算 SHA-256，识别多个来源抓到同样正文；
+6. 视频专项校验：
+   - 是否有 Transcript；
+   - 是否只有音乐、没有实质语音；
+   - 字幕是否与标题推导的关键主题明显不匹配。
+
+校验结果：
+
+- 无问题：fetch.status = validated；
+- 有问题：fetch.status = needs_manual_review；
+- 同时写 data/manifests/scrape_validation.jsonl。
+
+增量运行时，如果仅校验部分 source_id，代码会按 source_id 合并历史报告，避免用本次局部结果覆盖掉其他来源的历史校验记录。
+
+
+七、阶段 04：LLM 结构化抽卡
+----------------------------
+
+核心文件：
+
+    scripts/04_extract_cards.py
+    scripts/models.py
+    scripts/metric_aliases.py
+
+7.1 输入和前提
+
+只处理：
+
+- 已启用来源；
+- fetch.status=validated；
+- 对应 Markdown 文件存在；
+- 依照来源优先级、source_id、limit 等参数筛选后的资料。
+
+7.2 为什么不直接让 LLM 总结文章？
+
+因为“文章总结”不适合下游性能诊断。
+
+系统要求 LLM 将正文拆为原子化知识卡，例如：
+
+- 一个指标定义；
+- 一个性能现象模式；
+- 一个根因假设；
+- 一个验证方法；
+- 一个优化动作；
+- 一个案例证据；
+- 一个平台差异。
+
+这样下游检索时，能分别召回：
+
+    现象 + 根因 + 验证 + 优化
+
+而不是只召回一篇很长、很难使用的文章。
+
+7.3 长文如何处理？
+
+split_markdown(text, max_chars) 的策略：
+
+- 优先按 Markdown 标题分块；
+- 多个小节能放在同一块则拼在一起；
+- 单一小节超过 max_chars 时才硬切；
+- 尽量避免把完整概念或证据截断。
+
+7.4 LLM Prompt 怎么写：三层结构，不是“一句帮我总结”
+
+04 抽卡使用 OpenAI-compatible Chat Completions，调用时固定 temperature=0，以降低同样输入的随机性。一次请求由三部分组成：
+
+    System Prompt
+    + Output Schema Prompt
+    + User Prompt（来源元数据 + 当前正文块）
+
+(1) System Prompt：定义角色、任务边界和禁止事项
+
+模型被定义为“性能分析知识工程师”，任务不是总结文章，而是把原文拆为后续指标解释、异常判断、归因与优化模块可复用的原子知识卡。
+
+系统提示要求：
+
+1. 只能抽取正文明确支持的事实、机制、验证方法、优化动作和案例；没有证据就不生成；
+2. 单篇资料不要求凑完整闭环，不能为了完整性补造根因或优化；
+3. 必须区分现象、根因、验证、优化、案例、平台差异、指标定义；
+4. 单个汇总指标不能直接断言根因，必须保留 contradicting_signals 和 cannot_conclude；
+5. 不得编造函数名、调用栈、阈值或收益百分比；
+6. metrics 只能使用允许的 PerfDog 指标；“帧率、CPU、GPU、内存”等泛概念不能硬映射到 avgFps、cpuAvgPct 等精确字段；
+7. 无法映射的信息放到 unmapped_signals；evidence_excerpt 必须极短，且主要使用中文转述；
+8. 纯接入教程、纯 UI 实现细节、与性能现象/验证/优化无关的内容不生成卡；一段正文允许生成 0 张卡。
+
+它的作用不是让模型“更聪明”，而是压缩模型可输出的范围：宁可少产出，也不引入文章外推断。
+
+(2) Output Schema Prompt：定义 JSON 合同
+
+Prompt 明确只允许输出：
+
+    {"cards": [KnowledgeCard, ...]}
+
+并逐项列出必填字段、数组字段、card_type 枚举、SourceClaim 结构；还要求“不要输出 Markdown，不要解释，只输出 JSON”。这一步把自然语言生成收缩为固定数据合同。
+
+(3) User Prompt：只提供本次抽卡所需的受限上下文
+
+每个 Markdown chunk 的 User Prompt 由代码动态拼装：
+
+    A. 来源元数据：source_id、title、url、source_type、platforms_hint、engines_hint、
+       usage_scopes_hint、root_cause_categories_hint、mapped_metrics_hint、generalization_policy；
+    B. 当前抽卡目标：优先卡类型、禁止内容、每块最大卡数、定量值允许条件；
+    C. ALLOWED_METRICS 指标白名单；
+    D. 当前正文块，而不是无限长度全文。
+
+关键限制：
+
+- mapped_metrics_hint 非空且正文确实解释这些指标时，才鼓励锚定到对应指标；
+- 只有正文出现明确统计口径（avg、peak、p95、p99、1% low、每 10 分钟等）才允许映射具体 metrics；
+- 录屏、截图、进程选择、配置开关等内容若缺少指标/现象/验证关系，不得包装为 root_cause 或 optimization_action；
+- 每个 chunk 默认最多 3 张卡，避免把一篇文章过度切碎。
+
+因此模型收到的实际任务是：
+
+    “这是什么来源、服务什么性能场景、允许使用哪些指标、哪些内容禁止生成、
+    当前最多产几张卡；请只从下面这段正文中抽取被证据支持的卡。”
+
+
+
+7.5 Pydantic Schema 做什么？
+
+LLM 输出必须是：
+
+    {"cards": [KnowledgeCard, ...]}
+
+每张 KnowledgeCard 至少由以下结构组成：
+
+- canonical_key：稳定英文 snake_case 概念键；
+- card_type：7 种枚举之一；
+- title / summary；
+- platforms / engines / graphics_apis；
+- metrics / unmapped_signals；
+- observed_pattern；
+- required_signals / supporting_signals；
+- contradicting_signals / cannot_conclude；
+- verification_steps；
+- optimization_actions；
+- expected_metric_effects；
+- risks / applicability / limitations；
+- generalization_level；
+- source_claims。
+
+SourceClaim 包括：
+
+- claim：来源支持的主张；
+- evidence_location：原文位置；
+- evidence_excerpt：极短摘录；
+- claim_type：explicit / paraphrase / inference。
+
+Pydantic 能保证：
+
+- JSON 结构合法；
+- 枚举值合法；
+- 数组字段不是字符串；
+- 必填字段不缺失。
+
+Pydantic 不能保证：
+
+- 内容一定真实；
+- 因果关系一定成立；
+- LLM 没有误解原文。
+
+因此 Pydantic 是“结构闸门”，不是“事实真伪证明器”。
+
+7.5.1 Pydantic 通过后，代码还会继续控制输出
+
+模型 JSON 通过 Pydantic 后不会直接写入 cards_draft.jsonl，而是经过 normalize_card_payload() 规则整形：
+
+- canonical_key 强制清洗为小写 snake_case；
+- title、summary 和数组字段清洗空值、去重；
+- platforms、engines 使用别名统一；
+- source_claims 去空、去重、截短 evidence_excerpt；
+- metrics、required_signals、supporting_signals 只保留允许的结构化指标；
+- 无法映射的值迁移到 unmapped_signals，而不是伪装成指标；
+- 依据来源元数据回填可安全推断的指标锚点，并修正 generalization_level；
+- 非优化类卡清空 optimization_actions 与 expected_metric_effects，避免每张卡都被模型写成万能优化建议。
+
+随后还有来源内治理：
+
+    模型候选卡
+    -> chunk 筛选
+    -> 生成稳定 card_id
+    -> 按 (card_type, canonical_key) 去重
+    -> 本地 score_card 排序
+    -> 应用每块、每来源卡片上限
+    -> 写入 cards_draft.jsonl
+
+默认预算：
+
+    max_chars=12000
+    max_cards_per_chunk=3
+    max_cards_per_source=10
+
+这意味着真实控制链是：
+
+    Prompt 限制语义边界
+    -> Pydantic 校验 JSON 结构
+    -> 本地规则归一字段和收紧指标
+    -> 本地规则去重、评分、限额
+    -> 再写入草稿知识库
+
+7.6 LLM 输出失败如何处理？
+
+
+流程为：
+
+    调用 Chat Completions（temperature=0）
+    -> 若模型没有返回文本，直接报错
+    -> 去掉可能的 Markdown code fence
+    -> 从文本中提取最外层 JSON object
+    -> ExtractionResult.model_validate_json
+    -> 若 schema 失败，带上“原始 JSON + Pydantic 错误信息”触发一次 repair
+    -> repair Prompt 要求不改变原意、不补新事实，只修字段、数组、缺失值和 JSON 格式
+    -> 再次 Pydantic 校验
+    -> 若仍失败，本次 chunk 失败，由调用方观察异常并重跑
+
+注意：
+
+- repair 最多是一次格式补救，不是无限重试；
+- repair 不代表事实被重新验证；
+- 抽卡没有“模型失败后自动改用纯规则生成知识卡”的降级；
+- 语义标签阶段才有在非 required 模式下退回 heuristic fallback 的机制。
+
+
+7.7 抽卡产物和进度审计
+
+输出：
+
+    data/cards/cards_draft.jsonl
+    data/manifests/extract_usage.jsonl
+
+usage 文件会记录来源的 chunk 处理状态。下次运行时：
+
+- 如果发现来源只处理了部分 chunk；
+- 会清理该来源的半成品卡；
+- 再完整重抽，避免半篇文章的卡片混入正式资产。
+
+还会审计：
+
+- 有 usage 但未完成；
+- 完全没有 usage；
+- 已处理完整但 0 张卡。
+
+这不等于“每个模型请求都自动无限重试”，而是具备 chunk 级处理进度、半成品识别和可重跑能力。
+
+
+八、阶段 05：规则优先的卡片校验 + 轻量 LLM 语义标签
+-------------------------------------------------------
+
+核心文件：
+
+    scripts/05_validate_cards.py
+
+8.1 这一阶段为什么仍然需要 LLM？
+
+04 负责生成候选卡。05 的主要任务是判断这些候选是否适合作为下游知识资产。
+
+大部分问题可以通过硬规则判断：
+
+- 结构字段是否完整；
+- 指标是否合法；
+- 平台/引擎标签是否合理；
+- 指标锚点是否不足；
+- 是否属于测量/采集约束；
+- 是否过度依赖外部工具；
+- 是否属于偏录制、截图、流程说明的非主链路方法论；
+- 是否需要人工审核。
+
+但以下问题偏语义、难以完全写死：
+
+- 中文表达是否被过长英文污染；
+- 语气是否过满、绝对化；
+- 工具是辅助验证，还是结论本身依赖工具；
+- 内容本体是诊断知识，还是采集方法/测量限制。
+
+因此只把“边界卡”送给 LLM 标签器。
+
+8.2 05 中 LLM 的 Prompt 与输出被严格限制
+
+05 的模型不是“重新读原文并判断整张卡对不对”。它是一个局部文本标签器，Prompt 结构比 04 更窄：
+
+    System Prompt：定义四个标签的枚举语义、禁止事项、保守默认值。
+    User Prompt：只发送当前需要判断的少量卡片字段，不发送整篇原文。
+    Pydantic Schema：只接受四类固定枚举标签。
+
+系统提示明确：
+
+    “只负责局部文本标签；不负责业务评审，不判断知识价值，不推断项目背景；
+    信息不足时必须使用最保守的标签。”
+
+模型只允许输出四个固定枚举标签：
+
+1. language_mix：中文表达是否被不必要的英文污染
+
+    clean
+    mixed_but_acceptable
+    mixed_problematic
+
+2. claim_tone：结论语气是否过度确定
+
+    neutral
+    slightly_strong
+    overclaim
+
+3. tool_reference_role：外部工具在卡片中的角色
+
+    none
+    supplementary_reference
+    dependency
+
+4. content_role：卡片主体到底是诊断知识还是采集/测量说明
+
+    general_reasoning
+    tool_capture_methodology
+    measurement_or_capture_constraint
+    mixed_or_unclear
+
+User Prompt 不会把整张卡所有字段都发给模型，而是按 requested_checks 最小化组装 payload：
+
+- 所有边界检查共用：card_id、card_type、requested_checks、source_type_hint、title、summary；
+- 判断 language_mix 时，只附 observed_pattern 与最多 3 条 source_claim；
+- 判断 claim_tone 时，只附 cannot_conclude、limitations；
+- 判断 tool_reference_role 时，只附检测到的外部工具、工具出现位置提示、verification_steps、limitations、cannot_conclude、少量 source_claim；
+- 判断 content_role 时，只附工具名、observed_pattern、verification_steps、limitations、cannot_conclude、少量 source_claim。
+
+这样做有两个目的：
+
+1. 减少 token 和泄露无关上下文，降低模型被长文本干扰的概率；
+2. 把模型的任务限定为“给指定字段贴标签”，而不是自由评价知识卡。
+
+如果模型格式不合法，也只允许做一次 JSON repair；repair Prompt 会要求“不补充新事实”，并在信息不足时回到保守默认值。
+
+因此不能说“05 的 LLM 会判断知识卡是否正确、有价值或最终是否可用”。它只提供可被规则消费的局部语义信号。
+
+
+
+8.3 成本优化：规则短路、批处理、缓存
+
+处理顺序：
+
+    结构规则/来源约束/指标约束
+    -> 判断是否存在需要模型判断的字段
+    -> 没有边界问题：skipped
+    -> 缓存命中：cache_hit
+    -> 非 required 模式：使用 heuristic fallback 或默认值
+    -> 需要模型：按批调用 LLM
+    -> Pydantic 校验/必要时 JSON repair
+    -> 写校验结果与语义缓存
+
+默认语义批量大小为 12 张卡。
+
+缓存 key 会结合：
+
+- SEMANTIC_PROMPT_VERSION；
+- 模型名；
+- 发送给模型的 payload。
+
+当前代码中的语义 Prompt 版本为：
+
+    2026-06-23-v2
+
+缓存的含义：避免同样的“边界语义校验”重复花模型调用成本。
+
+它不是：
+
+- 所有抽卡结果缓存；
+- 通用对话缓存；
+- 向量 embedding 缓存。
+
+8.4 P0/P1 与 warning
+
+校验后卡片会得到：
+
+- card_priority：P0 或 P1；
+- review_status；
+- validation_warnings；
+- card_priority_reason。
+
+典型 warning 包括：
+
+    low_metric_anchor
+    measurement_constraint_card
+    non_core_methodology_card
+    language_mixed_output
+    claim_strength_may_overreach
+    platform_scope_exceeds_source_hint
+    engine_scope_exceeds_source_hint
+    external_tool_dependency
+
+这些 warning 不是“程序报错”，而是知识使用风险提示。
+
+最终输出：
+
+    data/cards/cards_validated.jsonl
+    各类 validation report
+    semantic cache
+    semantic usage report
+
+
+九、阶段 06：从知识卡渲染为 Wiki
+--------------------------------
+
+核心文件：
+
+    scripts/06_render_wiki.py
+
+这一阶段不调用 LLM，只是确定性渲染。
+
+9.1 按卡类型分类输出
+
+    01_metrics          指标定义
+    02_patterns         现象模式
+    03_root_causes      根因卡
+    04_verification     验证方法
+    05_optimizations    优化动作
+    06_cases            案例证据
+    07_platforms        平台差异
+
+每张卡会被渲染成一个 Markdown 页面，包含：
+
+- front matter：id、canonical_key、type、priority、review_status、warnings、平台、引擎、指标、source_id；
+- 摘要；
+- 使用定位；
+- 观测模式；
+- PerfDog 指标与结构化信号；
+- 反证和不能直接下的结论；
+- 验证步骤；
+- 优化动作；
+- 风险、适用条件、局限；
+- 来源证据和原始链接。
+
+9.2 两个索引视图
+
+    wiki/index.md
+        全量视图，包含当前可渲染的 P0/P1 卡。
+
+    wiki/index_core.md
+        核心视图，只保留适合作为 PerfDog 主链路依据的 P0 卡。
+
+核心视图还会排除“测量约束卡”“非核心方法论卡”等不适合作为主归因依据的内容。
+
+9.3 增量渲染
+
+当传入指定 source_id 且使用默认视图时：
+
+- 只删除和重建该来源相关的页面；
+- 全量重建 index.md / index_core.md，避免索引与页面集合口径不一致。
+
+若使用 include_needs_review 或 core_only 等非默认视图，系统会回退为全量重建，确保结果一致。
+
+
+十、它和 RAG / 归因 Agent 的关系
+--------------------------------
+
+perfdog_llm_wiki_starter 的职责到 Wiki 为止。
+
+它的正式上游产物是：
+
+    cards_validated.jsonl
+    wiki/
+
+下游 perfdog_dual_rag 会：
+
+    validated cards + Wiki
+    -> 按 card_id 对齐
+    -> 构建 rag_docs.jsonl
+    -> 构建 Qdrant dense/sparse 索引
+    -> 按平台、引擎、指标、症状、反证检索
+    -> 返回带来源、验证、优化、风险的 Agent context
+
+最终归因 Agent 才会结合：
+
+    当前性能报告的真实测量数据
+    + 检索到的知识证据
+    + 验证建议与反证
+
+形成最终分析。
+
+因此准确边界是：
+
+    Wiki Starter：生产和治理知识。
+    Dual RAG：检索和打包知识。
+    下游 Agent：基于当前报告事实与知识证据进行归因/回答。
+
+不能说 Wiki Starter 自己已经完成实时性能根因裁决。
+
+
+十一、通过 Gateway 如何触发这条流程
+--------------------------------------
+
+直接运行脚本时，可以按 01 -> 06 手动执行。
+
+通过 perfdog_service_gateway 时，可以调用：
+
+    POST /api/wiki-starter/ingest-source
+
+或对应 MCP tool：
+
+    perfdog_wiki_starter_ingest_source
+
+Gateway 会把写操作放入 MySQL Job 队列，由 Worker 执行。
+
+注意区分两个调用面：
+
+1. 直接 Python 调用 run_ingest_source_pipeline：
+
+    默认 rebuild_rag=false。
+    它负责来源 -> 卡片 -> Wiki；默认不会重建下游 RAG。
+
+2. 通过 HTTP/MCP 创建 wiki.ingest_source Job：
+
+    HTTP 成功只代表 Job 已入队，不代表知识已构建完成。
+    应继续查询 GET /api/jobs/<job_id>。
+    当前 Worker 对成功 ingest Job 会执行 follow-up full 发布构建，因此必须看 Job result，而不能只记“ingest 默认不重建 RAG”。
+
+
+十二、技术栈汇总
+----------------
+
+- Python 3.11 ~ 3.12；
+- MySQL：来源注册、抓取/审核状态、Job、lease、release 等；
+- Flask：来源人工管理 Webapp；
+- Firecrawl：网页抓取；
+- requests：Firecrawl HTTP 调用；
+- Playwright：视频页面/字幕操作；
+- Bilibili API：字幕备用获取；
+- ffmpeg：音频转码与处理；
+- Whisper 或 OpenAI-compatible ASR：音频转文本；
+- OpenAI-compatible Chat Completions：04 抽卡与 05 语义标签；
+- Pydantic：结构化 LLM 输出验证；
+- JSONL：卡片、usage、validation manifest 等可审计文件资产；
+- Markdown：人可阅读、可 Git diff 的 Wiki；
+- Gateway：HTTP API、MCP、Job Worker 编排；
+- Dual RAG / Qdrant：下游检索和证据包构建。
+
+
+十三、可靠性设计与局限
+----------------------
+
+已实现的可靠性机制：
+
+- URL 归一化 + 稳定 source_id，支持去重与重复同步；
+- 自动字段与人工字段分离，避免批处理覆盖人工决策；
+- 来源编辑乐观锁；
+- Firecrawl 指数退避重试；
+- 网页/视频按 fetch.strategy 分流；
+- 保留 raw/meta/Markdown 三类中间资产；
+- 正文质量门禁，过滤错误页、短文本、重复内容；
+- 抽卡分块、Pydantic 校验、JSON repair；
+- usage 审计和半成品来源清理重跑；
+- 05 规则短路、批量 LLM、版本化语义缓存；
+- Wiki 增量重渲染；
+- Gateway Job lease、heartbeat、MySQL single-writer lock。
+
+当前局限：
+
+- 不是自主 Agent，没有规划器、工具调用循环或自我反思闭环；
+- LLM 输出即使通过 Pydantic 也不等于事实完全正确；
+- 当前需要人工审核和来源证据约束；
+- cards_validated 表示通过当前校验策略，不等于已经完成实验级因果验证；
+- API/Job 目前没有统一幂等键、自动指数退避 Job retry、回调或事件流；
+- RAG 召回结果是证据，不是最终性能结论。
+
+
+十四、面试表达模板
+------------------
+
+简版：
+
+“我们把 LLM 放在知识构建链路里，而不是让它直接裁决性能问题。系统先把专家链接登记到 MySQL，人工维护启用和优先级；然后按网页或视频类型抓取正文/字幕，保留 raw、meta、Markdown，并通过规则校验过滤错误页、短文本和重复内容。通过质量门禁后，LLM 按 Pydantic schema 把正文分块抽成现象、根因、验证、优化、反证和来源证据等结构化知识卡。随后用规则优先、批量 LLM 语义标签的方式做二次校验，输出 validated cards 和 Markdown Wiki。下游 RAG 再检索这些知识，为归因 Agent 提供带来源、验证路径、风险的证据包。”
+
+被问“为什么不让 LLM 全自动处理”时：
+
+“抓取策略、状态管理、幂等、重试、字段约束和质量门禁都是确定性工程问题，用规则更稳定、成本更低、也便于审计。模型只用于它更擅长的非结构化理解：从正文抽取知识候选，以及给少量边界内容打有限的语义标签。这样避免模型决定流程和数据真源，降低了黑盒性。”
+
+被问“如何控制模型输出与幻觉”时：
+
+“我们不是只靠一句 Prompt。04 使用 System Prompt 定义证据边界、禁止编造、指标映射规则和 JSON 合同，User Prompt 再注入来源类型、平台/引擎提示、允许指标、卡片预算和正文块；模型 temperature 固定为 0。输出先过 Pydantic，失败最多做一次只修格式的 repair。通过结构校验后，仍由代码做指标白名单收紧、平台/引擎归一、无效字段清空、去重和卡片限额。05 阶段的模型不重新判断知识正确性，只对边界卡输出四类固定语义标签，并且有规则短路、最小 payload、批处理和版本化缓存。最后保留 source_claims、证据位置和短摘录，RAG/Agent 只能把它作为证据，而不能直接当成当前测量事实。”
+
